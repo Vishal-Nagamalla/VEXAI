@@ -40,7 +40,7 @@ Build a simulation tool where a user selects a team (Red or Blue) and, based on 
 
 ## AI Techniques
 - **Monte Carlo Tree Search (MCTS):** Simulates thousands of move sequences to evaluate and select the optimal scoring strategy
-- **Heuristic Search (e.g., A*, Greedy):** Prioritizes movement toward high-value goals and areas with scoring potential
+- **Heuristic Search (e.g., A\*, Greedy):** Prioritizes movement toward high-value goals and areas with scoring potential
 - **Reinforcement Learning:** (Optional) Allows agents to learn scoring patterns and environmental layouts over repeated simulations
 - **Machine Learning:** Predictive modeling for strategy evaluation and scoring efficiency
 - **Probabilistic Reasoning:** Handles uncertainty and partial visibility (e.g., object positioning or opponent interference)
