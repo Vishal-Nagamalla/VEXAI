@@ -3,6 +3,7 @@ import random
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
+import time
 
 GRID_SIZE = 24
 NUM_RINGS_PER_COLOR = 24
@@ -118,6 +119,22 @@ def draw_field(grid, team_color="red"):
 def on_team_select(team):
     print(f"You selected the {team.upper()} alliance.")
     window.destroy()
+    # Run A* search to plan robot actions for two bots
+    from ai_search_engine import a_star_search, State
+    # Define spawn positions for each team
+    if team == "blue":
+        spawns = [(1, 22), (2, 22)]
+    else:
+        spawns = [(22, 1), (23, 1)]
+    for idx, (sx, sy) in enumerate(spawns, start=1):
+        start_state = State(x=sx, y=sy, rings=0, delivered=0)
+        t0 = time.time()
+        plan = a_star_search(start_state, field.get_grid(), team)
+        t1 = time.time()
+        print(f"=== Bot {idx} Planned Actions (time {t1 - t0:.2f}s) ===")
+        for step in plan:
+            print("-", step)
+    # After AI plans, display the field
     draw_field(field.get_grid(), team_color=team)
 
 def launch_ui():
