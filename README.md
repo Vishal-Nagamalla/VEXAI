@@ -60,6 +60,6 @@ Build a simulation tool where a user selects a team (Red or Blue) and, based on 
   - `numpy` — grid structure and calculations
   - `random` — object generation and environment randomness
   - `heapq` — priority queue for A* search
-  - `matplotlib` or `pygame` (optional) — for field visualization
-  - `scikit-learn` (optional) — for ML analysis of strategies
+  - `matplotlib` or `pygame` — for field visualization
+  - `scikit-learn` — for ML analysis of strategies
   - `json`, `argparse` — for configuration and input/output control
