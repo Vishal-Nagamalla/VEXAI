@@ -17,19 +17,20 @@ class State:
       - goals_delivered (list of goals already placed in corners)
       - grid snapshot if you need to mutate (optional)
     """
-    __slots__ = ('x','y','rings','delivered')
-    def __init__(self, x, y, rings=0, delivered=0):
+    __slots__ = ('x','y','rings','delivered','goal_loaded')
+    def __init__(self, x, y, rings=0, delivered=0, goal_loaded=False):
         self.x = x
         self.y = y
         self.rings = rings
         self.delivered = delivered
+        self.goal_loaded = goal_loaded
 
     def __eq__(self, other):
-        return (self.x, self.y, self.rings, self.delivered) == \
-               (other.x, other.y, other.rings, other.delivered)
+        return (self.x, self.y, self.rings, self.delivered, self.goal_loaded) == \
+               (other.x, other.y, other.rings, other.delivered, other.goal_loaded)
 
     def __hash__(self):
-        return hash((self.x, self.y, self.rings, self.delivered))
+        return hash((self.x, self.y, self.rings, self.delivered, self.goal_loaded))
 
 class Node:
     def __init__(self, state, g=0, h=0, parent=None, action=None):
@@ -76,13 +77,13 @@ def get_successors(node, field, team_color):
     for name,(dx,dy) in DIRS.items():
         nx, ny = s.x+dx, s.y+dy
         if 0 <= nx < N and 0 <= ny < N:
-            new = State(nx, ny, s.rings, s.delivered)
+            new = State(nx, ny, s.rings, s.delivered, s.goal_loaded)
             succ.append((new, f"Move {name}", 1))
 
     # 2) PickUpRing if ring of our color present and we carry <2
     sym = 'r' if team_color=='red' else 'b'
     if s.rings < 2 and field[s.y][s.x].count(sym) > 0:
-        new = State(s.x, s.y, s.rings+1, s.delivered)
+        new = State(s.x, s.y, s.rings+1, s.delivered, s.goal_loaded)
         succ.append((new, "PickUpRing", 1))
 
     # 3) DropRing into mobile goal if adjacent
@@ -92,13 +93,15 @@ def get_successors(node, field, team_color):
         for dx,dy in DIRS.values():
             ax, ay = s.x+dx, s.y+dy
             if 0 <= ax < N and 0 <= ay < N and field[ay][ax].count('G')>0:
-                new = State(s.x, s.y, 0, s.delivered)
+                new = State(s.x, s.y, 0, s.delivered, s.goal_loaded)
+                new.goal_loaded = True
                 succ.append((new, "LoadGoal", 1))
 
     # 4) DeliverGoal if in a positive corner
     corners = RED_POSITIVE+BLUE_POSITIVE
-    if (s.x,s.y) in corners and s.delivered >= 0:  # if we have loaded
-        new = State(s.x, s.y, 0, s.delivered+1)
+    if (s.x,s.y) in corners and s.goal_loaded:  # if we have loaded
+        new = State(s.x, s.y, 0, s.delivered+1, s.goal_loaded)
+        new.goal_loaded = False
         succ.append((new, "DeliverGoal", 1))
 
     return succ
