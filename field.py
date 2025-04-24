@@ -2,6 +2,8 @@ import tkinter as tk
 import random
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import matplotlib.animation as animation
+from matplotlib.widgets import Button, Slider
 import numpy as np
 import time
 
@@ -18,8 +20,8 @@ class FieldObject:
 RING_RED    = FieldObject("ring_red",    "r", "red",        True)
 RING_BLUE   = FieldObject("ring_blue",   "b", "#4da6ff",   True)
 MOBILE_GOAL = FieldObject("goal",        "G", "lightgreen",True)
-ROBOT_RED   = FieldObject("robot_red",   "R", "#ff4d4d",   False)
-ROBOT_BLUE  = FieldObject("robot_blue",  "B", "#4da6ff",   False)
+ROBOT_RED   = FieldObject("robot_red",   "R", "#ff9999",   False)
+ROBOT_BLUE  = FieldObject("robot_blue",  "B", "#9999ff",   False)
 
 RED_POSITIVE   = [(22,22),(23,22),(22,23),(23,23)]
 BLUE_POSITIVE  = [(0,22),(1,22),(0,23),(1,23)]
@@ -68,13 +70,17 @@ class FieldGrid:
         return self.grid
 
 def draw_field(grid, team_color="red"):
-    fig, ax = plt.subplots(figsize=(12,12))
+    fig, ax = plt.subplots(figsize=(9,9))
     ax.set_xlim(0, GRID_SIZE)
     ax.set_ylim(0, GRID_SIZE)
     ax.set_xticks(np.arange(0, GRID_SIZE, 1))
     ax.set_yticks(np.arange(0, GRID_SIZE, 1))
     ax.set_facecolor("#d3d3d3")  # lighter grey
     ax.grid(True, which='both', color='black', linewidth=0.5)
+    ax.set_xticklabels([])
+    ax.set_yticklabels([])
+    ax.tick_params(axis='both', which='both', length=0)
+    #ax.set_facecolor("#f0e6ff")
 
     # draw corners
     for zone,label in [
@@ -82,7 +88,8 @@ def draw_field(grid, team_color="red"):
         (RED_NEGATIVE, '-'), (BLUE_NEGATIVE, '-')
     ]:
         for x,y in zone:
-            ax.add_patch(patches.Rectangle((x,y), 1,1, color='black'))
+            zoneColor = "darkred" if zone == RED_POSITIVE or zone == RED_NEGATIVE else "darkblue"
+            ax.add_patch(patches.Rectangle((x,y), 1,1, color=zoneColor))
         cx,cy = np.mean(zone, axis=0)
         ax.text(cx+0.25, cy+0.25, label,
                 color='white', fontsize=14, fontweight='bold')
@@ -97,20 +104,21 @@ def draw_field(grid, team_color="red"):
 
             # ring stacks
             if cell.count("r")==2 or cell.count("b")==2:
-                ax.text(x+0.3, y+0.3, "S",
-                        fontsize=12, fontweight='bold', color='white')
+                ax.text(x+0.3, y+0.7, "2",
+                        fontsize=12, fontweight='bold', color="black")
 
             for sym in cell:
                 if sym=="G":
-                    ax.add_patch(patches.Rectangle((x,y),1,1, color="lightgreen"))
+                    # ax.add_patch(patches.Rectangle((x,y),1,1, color=MOBILE_GOAL.color))
+                    ax.add_patch(patches.Circle((x+0.5,y+0.5),0.35, facecolor=MOBILE_GOAL.color, edgecolor='#aaaaaa', linewidth=1))
                 elif sym=="R":
-                    ax.add_patch(patches.Rectangle((x,y),1,1, color="#ff4d4d"))
+                    ax.add_patch(patches.Rectangle((x,y),1,1, facecolor=ROBOT_RED.color, edgecolor='black', linewidth=1))
                 elif sym=="B":
-                    ax.add_patch(patches.Rectangle((x,y),1,1, color="#4da6ff"))
+                    ax.add_patch(patches.Rectangle((x,y),1,1, facecolor=ROBOT_BLUE.color, edgecolor='black', linewidth=1))
                 elif sym=="r":
-                    ax.add_patch(patches.Circle((x+0.5,y+0.5),0.3, color="red"))
+                    ax.add_patch(patches.Circle((x+0.5,y+0.5),0.3, color=RING_RED.color))
                 elif sym=="b":
-                    ax.add_patch(patches.Circle((x+0.5,y+0.5),0.3, color="#4da6ff"))
+                    ax.add_patch(patches.Circle((x+0.5,y+0.5),0.3, color=RING_BLUE.color))
 
     plt.gca().invert_yaxis()
     plt.title("VEX U High Stakes Field View")
@@ -127,7 +135,7 @@ def on_team_select(team):
     else:
         spawns = [(22, 1), (23, 1)]
     for idx, (sx, sy) in enumerate(spawns, start=1):
-        start_state = State(x=sx, y=sy, rings=0, delivered=0)
+        start_state = State(x=sx, y=sy, rings=0, delivered=0, goal_loaded=False)
         t0 = time.time()
         plan = a_star_search(start_state, field.get_grid(), team)
         t1 = time.time()
@@ -168,6 +176,7 @@ def launch_ui():
         highlightbackground="#ff4d4d", highlightcolor="#ff4d4d",
         bd=0, relief="raised",
         padx=20, pady=8,
+        width=13,
         command=lambda: on_team_select("red")
     )
     red_btn.pack(pady=5)
@@ -182,6 +191,7 @@ def launch_ui():
         highlightbackground="#4da6ff", highlightcolor="#4da6ff",
         bd=0, relief="raised",
         padx=20, pady=8,
+        width=13,
         command=lambda: on_team_select("blue")
     )
     blue_btn.pack(pady=5)
