@@ -7,9 +7,10 @@ import numpy as np
 import time
 import copy
 from field import (GRID_SIZE, ROBOT_SIZE, POSITIVE_CORNERS, NEGATIVE_CORNERS, 
-                  POSITIVE_CORNERS_BLUE, NEGATIVE_CORNERS_BLUE, RED_STAKE, 
-                  BLUE_STAKE, FIXED_STAKES, DIRS, MAX_SIMULATION_STEPS,
-                  MAX_RINGS_PER_GOAL)
+                  POSITIVE_CORNERS_BLUE, NEGATIVE_CORNERS_BLUE, ALLIANCE_WALL_STAKES,
+                  NEUTRAL_WALL_STAKES, DIRS, MAX_SIMULATION_STEPS, SPAWN_POSITION,
+                  MAX_RINGS_ALLIANCE_STAKE, MAX_RINGS_NEUTRAL_STAKE, MAX_RINGS_MOBILE_STAKE)
+from scoring_module import calculate_score, get_best_goal_placement
 
 # ------------ GAME OBJECTS ------------
 class FieldObject:
@@ -32,45 +33,66 @@ class FieldGrid:
         # All occupied positions
         self.occupied = set(POSITIVE_CORNERS + NEGATIVE_CORNERS + 
                             POSITIVE_CORNERS_BLUE + NEGATIVE_CORNERS_BLUE +
-                            FIXED_STAKES + [RED_STAKE, BLUE_STAKE])
+                            NEUTRAL_WALL_STAKES + 
+                            [ALLIANCE_WALL_STAKES['red'], ALLIANCE_WALL_STAKES['blue']])
         
-        # Add fixed stakes
-        for x, y in FIXED_STAKES:
-            self.grid[y][x].append("stake")
+        # Add neutral wall stakes
+        for x, y in NEUTRAL_WALL_STAKES:
+            self.grid[y][x].append("neutral_stake")
         
-        # Add colored stakes
-        self.grid[RED_STAKE[1]][RED_STAKE[0]].append("red_stake")
-        self.grid[BLUE_STAKE[1]][BLUE_STAKE[0]].append("blue_stake")
+        # Add alliance wall stakes
+        red_stake = ALLIANCE_WALL_STAKES['red']
+        blue_stake = ALLIANCE_WALL_STAKES['blue']
+        self.grid[red_stake[1]][red_stake[0]].append("red_stake")
+        self.grid[blue_stake[1]][blue_stake[0]].append("blue_stake")
         
-        # Initialize goal ring counters
+        # Initialize ring counters for all stake types
+        self.stake_rings = {}
+        
+        # Add ring counters for alliance stakes
+        self.stake_rings[ALLIANCE_WALL_STAKES['red']] = {'red': 0, 'blue': 0}
+        self.stake_rings[ALLIANCE_WALL_STAKES['blue']] = {'red': 0, 'blue': 0}
+        
+        # Add ring counters for neutral stakes
+        for stake_pos in NEUTRAL_WALL_STAKES:
+            self.stake_rings[stake_pos] = {'red': 0, 'blue': 0}
+        
+        # Separate tracking for mobile goals and their rings
         self.goal_rings = {}  # (x,y) -> {'red': count, 'blue': count}
 
     def is_valid_position(self, x, y, size=1):
+        """Check if a position is valid for object placement"""
         for dx in range(size):
             for dy in range(size):
                 if not (0 <= x+dx < GRID_SIZE and 0 <= y+dy < GRID_SIZE):
                     return False
+                # Check if position is in the occupied list (stakes, scoring zones)
                 if (x+dx, y+dy) in self.occupied:
+                    return False
+                # Also check if this position has any objects already
+                if self.grid[y+dy][x+dx]:
                     return False
         return True
 
     def place_object(self, obj, count, size=1, allow_stack=False):
+        """Place objects on the field"""
         placed = 0
-        while placed < count:
+        attempts = 0
+        max_attempts = count * 100  # Avoid infinite loops
+        
+        while placed < count and attempts < max_attempts:
+            attempts += 1
             x = random.randint(0, GRID_SIZE - size)
             y = random.randint(0, GRID_SIZE - size)
 
-            if allow_stack:
-                if (x, y) in self.occupied:
-                    continue
-
-                stack = self.grid[y][x]
-                if len(stack) == 0:
-                    stack.append(obj.symbol)
+            # For rings, never allow stacking
+            if obj.symbol in ['r', 'b']:
+                if self.is_valid_position(x, y, size):
+                    self.grid[y][x].append(obj.symbol)
+                    # Mark position as occupied to prevent other objects being placed here
+                    self.occupied.add((x, y))
                     placed += 1
-                elif len(stack) == 1 and stack[0] in ['r', 'b']:
-                    stack.append(obj.symbol)
-                    placed += 1
+            # For other objects like goals, use the normal logic
             else:
                 if self.is_valid_position(x, y, size):
                     for dx in range(size):
@@ -83,12 +105,15 @@ class FieldGrid:
                         self.goal_rings[(x, y)] = {'red': 0, 'blue': 0}
                     
                     placed += 1
+        
+        if placed < count:
+            print(f"Warning: Could only place {placed}/{count} of object {obj.name} after {max_attempts} attempts")
 
     def get_grid(self):
         return self.grid
-
-# ------------ SIMULATOR --------------
+    
 class RobotSimulator:
+
     def __init__(self, field, team_color, robot_pos, plan):
         # field is deep‑copied so simulator can reset cleanly
         self.original_field = copy.deepcopy(field)
@@ -103,94 +128,161 @@ class RobotSimulator:
 
         self.ring_symbol = 'r' if team_color == 'red' else 'b'
         self.robot_symbol = 'R' if team_color == 'red' else 'B'
-        self.robot_states = [{'rings': 0, 'goal_loaded': False}]
+        self.robot_states = [{'rings': 0, 'goal_loaded': False, 'held_goal_rings': {'red': 0, 'blue': 0}}]
 
+        # Track last action for better UI feedback
+        self.last_action_result = ""
+
+        # Initialize field state from the original field
+        self._initialize_field_state()
+        
+        # Add robot to grid at start position
+        self._add_robot_to_grid(robot_pos[0], robot_pos[1])
+        
+        # Initialize history with initial state
+        self.history = [self._snapshot()]
+    
+    def _initialize_field_state(self):
+        """Initialize field state from the original field"""
         # gather original mobile goal locations and ring counts
         self.goal_positions = []
         self.goal_rings = {}
         
         for y in range(GRID_SIZE):
             for x in range(GRID_SIZE):
-                if 'G' in field.grid[y][x]:
-                    self.goal_positions.append((x, y))
-                    if (x, y) in field.goal_rings:
-                        self.goal_rings[(x, y)] = copy.deepcopy(field.goal_rings[(x, y)])
-                    else:
-                        self.goal_rings[(x, y)] = {'red': 0, 'blue': 0}
-
-        # Add robot to grid at start position
-        self._add_robot_to_grid(robot_pos[0], robot_pos[1])
-        
-        self.history = [self._snapshot()]
-
-    # ---------- history helpers ----------
-    def _snapshot(self):
-        return {
-            'field': copy.deepcopy(self.field),
-            'robot_positions': copy.deepcopy(self.robot_positions),
-            'robot_states': copy.deepcopy(self.robot_states),
-            'goal_positions': copy.deepcopy(self.goal_positions),
-            'goal_rings': copy.deepcopy(self.goal_rings)
-        }
-
-    # ---------- public controls ----------
-    def step_forward(self):
-        if self.current_step >= self.max_steps:
-            return False
-
-        action = self.plans[0][self.current_step]
-        self._execute_action(action)
-        self.current_step += 1
-        self.history.append(self._snapshot())
-        return True
-
-    def step_backward(self):
-        if self.current_step <= 0:
-            return False
-        self.current_step -= 1
-        state = self.history[self.current_step]
-        self.field = state['field']
-        self.robot_positions = state['robot_positions']
-        self.robot_states = state['robot_states']
-        self.goal_positions = state['goal_positions']
-        self.goal_rings = state['goal_rings']
-        return True
-
-    def reset(self):
-        self.field = copy.deepcopy(self.original_field)
-        self.current_step = 0
-        # Reset to original position
-        self.robot_positions = [self.original_robot_pos]
-        self.robot_states = [{'rings': 0, 'goal_loaded': False}]
-        
-        # Reset goal positions and ring counts from original field
-        self.goal_positions = []
-        self.goal_rings = {}
-        
-        for y in range(GRID_SIZE):
-            for x in range(GRID_SIZE):
-                if 'G' in self.original_field.grid[y][x]:
+                if 'G' in self.field.grid[y][x]:
                     self.goal_positions.append((x, y))
                     if (x, y) in self.original_field.goal_rings:
                         self.goal_rings[(x, y)] = copy.deepcopy(self.original_field.goal_rings[(x, y)])
                     else:
                         self.goal_rings[(x, y)] = {'red': 0, 'blue': 0}
         
-        # Make sure robot is on the grid
+        # Copy stake ring counters
+        self.stake_rings = copy.deepcopy(self.original_field.stake_rings)
+        
+        # Track all ring positions by color
+        self.ring_positions = {
+            'red': [],
+            'blue': []
+        }
+        for y in range(GRID_SIZE):
+            for x in range(GRID_SIZE):
+                if 'r' in self.field.grid[y][x]:
+                    self.ring_positions['red'].append((x, y))
+                if 'b' in self.field.grid[y][x]:
+                    self.ring_positions['blue'].append((x, y))
+        
+        # Track score
+        self.current_score = {'red': 0, 'blue': 0}
+        self.update_score()
+    
+    def _find_all_rings(self):
+        """Find all rings of the robot's color on the field"""
+        positions = []
+        for y in range(GRID_SIZE):
+            for x in range(GRID_SIZE):
+                if self.ring_symbol in self.field.grid[y][x]:
+                    positions.append((x, y))
+        return positions
+
+    # ---------- history helpers ----------
+    def _snapshot(self):
+        """Take a complete snapshot of the current state"""
+        return {
+            'field': copy.deepcopy(self.field),
+            'robot_positions': copy.deepcopy(self.robot_positions),
+            'robot_states': copy.deepcopy(self.robot_states),
+            'goal_positions': copy.deepcopy(self.goal_positions),
+            'goal_rings': copy.deepcopy(self.goal_rings),
+            'stake_rings': copy.deepcopy(self.stake_rings),
+            'ring_positions': copy.deepcopy(self.ring_positions),
+            'score': copy.deepcopy(self.current_score),
+            'last_action_result': self.last_action_result,
+            'current_step': self.current_step
+        }
+
+    # ---------- public controls ----------
+    def step_forward(self):
+        """Execute the next step in the plan"""
+        if self.current_step >= self.max_steps:
+            print("End of plan reached")
+            return False
+
+        action = self.plans[0][self.current_step]
+        self.last_action_result = ""  # Reset last action result
+        
+        # Execute the action and capture the result
+        self._execute_action(action)
+        self.current_step += 1
+        self.update_score()
+        self.history.append(self._snapshot())
+        return True
+
+    def step_backward(self):
+        """Return to the previous step using the restart approach"""
+        if self.current_step <= 0:
+            print("Already at beginning of simulation")
+            return False
+            
+        # Restart from beginning and execute steps until current_step - 1
+        self.reset(quiet=True)
+        target_step = self.current_step - 1
+        
+        for i in range(target_step):
+            if i < len(self.plans[0]):
+                action = self.plans[0][i]
+                self._execute_action(action)
+                self.current_step += 1
+                self.update_score()
+                self.history.append(self._snapshot())
+        
+        print("Stepped backward")
+        return True
+
+    def reset(self, quiet=False):
+        """Reset the simulator to its initial state"""
+        # Clear robot from current position
         self._clear_robot_from_grid()
+        
+        # Reset field to original state
+        self.field = copy.deepcopy(self.original_field)
+        self.current_step = 0
+        
+        # Reset to original position
+        self.robot_positions = [self.original_robot_pos]
+        self.robot_states = [{'rings': 0, 'goal_loaded': False, 'held_goal_rings': {'red': 0, 'blue': 0}}]
+        
+        # Reset the field state
+        self._initialize_field_state()
+        
+        # Reset last action result
+        self.last_action_result = ""
+        
+        # Make sure robot is on the grid
         self._add_robot_to_grid(self.original_robot_pos[0], self.original_robot_pos[1])
         
+        # Reset history
         self.history = [self._snapshot()]
+        
+        if not quiet:
+            print("Resetting simulation")
+        return True
+
+    def update_score(self):
+        """Update the current score based on the field state"""
+        self.current_score = calculate_score(self.field.grid, self.goal_positions, 
+                                            {**self.goal_rings, **self.stake_rings})
 
     # ---------- action execution ----------
     def _clear_robot_from_grid(self):
-        # Remove robot from entire grid (to handle reset properly)
+        """Remove the robot from the entire grid"""
         for y in range(GRID_SIZE):
             for x in range(GRID_SIZE):
                 if self.robot_symbol in self.field.grid[y][x]:
                     self.field.grid[y][x].remove(self.robot_symbol)
 
     def _remove_robot_from_grid(self, x, y):
+        """Remove the robot from its current position"""
         for dx in range(ROBOT_SIZE):
             for dy in range(ROBOT_SIZE):
                 nx, ny = x + dx, y + dy
@@ -199,11 +291,21 @@ class RobotSimulator:
                         self.field.grid[ny][nx].remove(self.robot_symbol)
 
     def _add_robot_to_grid(self, x, y):
+        """Add the robot to the grid at the specified position"""
         for dx in range(ROBOT_SIZE):
             for dy in range(ROBOT_SIZE):
                 nx, ny = x + dx, y + dy
                 if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
                     self.field.grid[ny][nx].append(self.robot_symbol)
+
+    def _robot_cells(self):
+        """Return all cells covered by the robot"""
+        x, y = self.robot_positions[0]
+        cells = []
+        for dx in range(ROBOT_SIZE):
+            for dy in range(ROBOT_SIZE):
+                cells.append((x+dx, y+dy))
+        return cells
 
     def _execute_action(self, action):
         x, y = self.robot_positions[0]
@@ -217,33 +319,123 @@ class RobotSimulator:
             new_x, new_y = x + dx, y + dy
             if not (0 <= new_x <= GRID_SIZE - ROBOT_SIZE and 0 <= new_y <= GRID_SIZE - ROBOT_SIZE):
                 # Invalid move, don't update position
-                print(f"Invalid move: ({new_x}, {new_y}) would be out of bounds")
+                error_msg = f"Invalid move: ({new_x}, {new_y}) would be out of bounds"
+                print(error_msg)
+                self.last_action_result = error_msg
                 return
-                
+                    
+            # Check if any part of the robot would be over an obstacle (ring, goal, stake)
+            invalid_move = False
+            obstacle_pos = None
+            for rdx in range(ROBOT_SIZE):
+                for rdy in range(ROBOT_SIZE):
+                    nx, ny = new_x + rdx, new_y + rdy
+                    if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
+                        cell = self.field.grid[ny][nx]
+                        # Don't allow moving over rings, goals, or stakes
+                        if 'r' in cell or 'b' in cell or 'G' in cell or "red_stake" in cell or "blue_stake" in cell or "neutral_stake" in cell:
+                            invalid_move = True
+                            obstacle_pos = (nx, ny)
+                            break
+                    if invalid_move:
+                        break
+                        
+            if invalid_move:
+                error_msg = f"Invalid move: {obstacle_pos} contains an obstacle"
+                print(error_msg)
+                self.last_action_result = error_msg
+                return
+                    
+            # Valid move, update position
             self._remove_robot_from_grid(x, y)
             x, y = new_x, new_y
             self.robot_positions[0] = (x, y)
             self._add_robot_to_grid(x, y)
+            self.last_action_result = f"Moved {direction} to position ({x}, {y})"
 
         elif action == "PickUpRing":
-            # Check all cells under the robot for rings
+            # Check perimeter around the robot for rings
             ring_found = False
+            ring_pos = None
+            
+            # Get all cells adjacent to the robot
+            perimeter = set()
             for dx in range(ROBOT_SIZE):
                 for dy in range(ROBOT_SIZE):
-                    nx, ny = x + dx, y + dy
-                    if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
-                        if self.ring_symbol in self.field.grid[ny][nx]:
-                            self.field.grid[ny][nx].remove(self.ring_symbol)
-                            state['rings'] += 1
-                            ring_found = True
-                            break  # Only pick up one ring per action
-                if ring_found:
+                    rx, ry = x + dx, y + dy
+                    if 0 <= rx < GRID_SIZE and 0 <= ry < GRID_SIZE:
+                        # Check all 4 directions from this robot cell
+                        for dir_x, dir_y in DIRS.values():
+                            nx, ny = rx + dir_x, ry + dir_y
+                            if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
+                                # Don't include cells under the robot
+                                if not (x <= nx < x + ROBOT_SIZE and y <= ny < y + ROBOT_SIZE):
+                                    perimeter.add((nx, ny))
+                
+            # Check for rings in the perimeter
+            for nx, ny in perimeter:
+                if self.ring_symbol in self.field.grid[ny][nx]:
+                    # Remove the ring from the field
+                    self.field.grid[ny][nx].remove(self.ring_symbol)
+                    
+                    # Remove the ring from our tracking list
+                    ring_type = 'red' if self.ring_symbol == 'r' else 'blue'
+                    ring_pos = (nx, ny)
+                    if ring_pos in self.ring_positions[ring_type]:
+                        self.ring_positions[ring_type].remove(ring_pos)
+                    
+                    # Add ring to robot inventory
+                    state['rings'] += 1
+                    ring_found = True
+                    success_msg = f"Picked up {self.team_color} ring at {ring_pos}."
+                    print(success_msg)
+                    self.last_action_result = success_msg
                     break
+            
+            if not ring_found:
+                # No ring found - look for nearby rings to suggest
+                nearby_msg = f"No {self.team_color} ring found adjacent to robot to pick up"
+                print(nearby_msg)
+                
+                # Look for nearest ring to suggest a move
+                nearest_ring = None
+                nearest_dist = float('inf')
+                for rx, ry in self.ring_positions[self.team_color]:
+                    dist = abs(x - rx) + abs(y - ry)
+                    if dist < nearest_dist:
+                        nearest_dist = dist
+                        nearest_ring = (rx, ry)
+                
+                if nearest_ring:
+                    suggestion = f"Consider moving toward the ring at {nearest_ring} instead"
+                    print(suggestion)
+                    self.last_action_result = f"{nearby_msg}. {suggestion}"
+                else:
+                    self.last_action_result = f"{nearby_msg}. No rings of your color remain on the field."
 
         elif action.startswith("PlaceRingOnGoal"):
-            # New action to place a ring on a mobile goal
+            # Place a ring on a mobile goal
             if state['rings'] > 0:
-                # Check perimeter around robot for a goal
+                # If the robot is carrying a goal, place ring on that goal
+                if state['goal_loaded']:
+                    # Check if the held goal has reached maximum capacity
+                    ring_type = 'red' if self.ring_symbol == 'r' else 'blue'
+                    total_rings = state['held_goal_rings']['red'] + state['held_goal_rings']['blue']
+                    
+                    if total_rings < MAX_RINGS_MOBILE_STAKE:
+                        # Add the ring to the goal's inventory
+                        state['held_goal_rings'][ring_type] += 1
+                        state['rings'] -= 1
+                        success_msg = f"Placed {ring_type} ring on held goal. Goal now has {state['held_goal_rings']}"
+                        print(success_msg)
+                        self.last_action_result = success_msg
+                    else:
+                        error_msg = f"Held goal is already at maximum capacity ({MAX_RINGS_MOBILE_STAKE} rings)"
+                        print(error_msg)
+                        self.last_action_result = error_msg
+                    return
+                
+                # Otherwise, check perimeter for goals
                 perim = set()
                 for rx, ry in self._robot_cells():
                     for dx, dy in DIRS.values():
@@ -254,23 +446,111 @@ class RobotSimulator:
                 # Remove cells under the robot
                 perim = perim - set(self._robot_cells())
                 
+                # First check if there are any goals with available capacity
+                goal_found = False
                 for px, py in perim:
                     if (px, py) in self.goal_positions:
-                        # We found a goal to place the ring on
                         goal_pos = (px, py)
                         ring_type = 'red' if self.ring_symbol == 'r' else 'blue'
                         
                         # Check if goal has space for more rings
                         total_rings = self.goal_rings[goal_pos]['red'] + self.goal_rings[goal_pos]['blue']
-                        if total_rings < MAX_RINGS_PER_GOAL:
+                        if total_rings < MAX_RINGS_MOBILE_STAKE:
                             # Place ring on goal
                             self.goal_rings[goal_pos][ring_type] += 1
                             state['rings'] -= 1
-                            print(f"Placed {ring_type} ring on goal at {goal_pos}. Goal now has {self.goal_rings[goal_pos]}")
+                            goal_found = True
+                            success_msg = f"Placed {ring_type} ring on goal at {goal_pos}. Goal now has {self.goal_rings[goal_pos]}"
+                            print(success_msg)
+                            self.last_action_result = success_msg
                             break
+                        else:
+                            error_msg = f"Goal at {goal_pos} is already at maximum capacity ({MAX_RINGS_MOBILE_STAKE} rings)"
+                            print(error_msg)
+                            self.last_action_result = error_msg
+                
+                if not goal_found and state['rings'] > 0:
+                    error_msg = "No goal with available capacity found to place ring on"
+                    print(error_msg)
+                    self.last_action_result = error_msg
+            else:
+                error_msg = "Cannot place ring: no rings in inventory"
+                print(error_msg)
+                self.last_action_result = error_msg
+                        
+        elif action.startswith("PlaceRingOnStake"):
+            # Place a ring on an alliance or neutral stake
+            if state['rings'] > 0:
+                # Check perimeter around robot for a stake
+                perim = set()
+                for rx, ry in self._robot_cells():
+                    for dx, dy in DIRS.values():
+                        nx, ny = rx + dx, ry + dy
+                        if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
+                            perim.add((nx, ny))
+                
+                # Remove cells under the robot
+                perim = perim - set(self._robot_cells())
+                
+                stake_found = False
+                
+                # Try alliance stake first (higher priority)
+                alliance_stake = ALLIANCE_WALL_STAKES[self.team_color]
+                if alliance_stake in perim:
+                    max_rings = MAX_RINGS_ALLIANCE_STAKE
+                    if alliance_stake in self.stake_rings:
+                        total_rings = self.stake_rings[alliance_stake]['red'] + self.stake_rings[alliance_stake]['blue']
+                        if total_rings < max_rings:
+                            ring_type = 'red' if self.ring_symbol == 'r' else 'blue'
+                            self.stake_rings[alliance_stake][ring_type] += 1
+                            state['rings'] -= 1
+                            stake_found = True
+                            success_msg = f"Placed {ring_type} ring on alliance stake at {alliance_stake}"
+                            print(success_msg)
+                            self.last_action_result = success_msg
+                        else:
+                            error_msg = f"Alliance stake at {alliance_stake} is already at maximum capacity ({MAX_RINGS_ALLIANCE_STAKE} rings)"
+                            print(error_msg)
+                            self.last_action_result = error_msg
+                
+                # Try neutral stakes if alliance stake wasn't available
+                if not stake_found:
+                    for stake_pos in NEUTRAL_WALL_STAKES:
+                        if stake_pos in perim:
+                            max_rings = MAX_RINGS_NEUTRAL_STAKE
+                            if stake_pos in self.stake_rings:
+                                total_rings = self.stake_rings[stake_pos]['red'] + self.stake_rings[stake_pos]['blue']
+                                if total_rings < max_rings:
+                                    ring_type = 'red' if self.ring_symbol == 'r' else 'blue'
+                                    self.stake_rings[stake_pos][ring_type] += 1
+                                    state['rings'] -= 1
+                                    stake_found = True
+                                    success_msg = f"Placed {ring_type} ring on neutral stake at {stake_pos}"
+                                    print(success_msg)
+                                    self.last_action_result = success_msg
+                                    break
+                                else:
+                                    error_msg = f"Neutral stake at {stake_pos} is already at maximum capacity ({MAX_RINGS_NEUTRAL_STAKE} rings)"
+                                    print(error_msg)
+                                    self.last_action_result = error_msg
+                
+                if not stake_found and state['rings'] > 0:
+                    error_msg = "No stake with available capacity found to place ring on"
+                    print(error_msg)
+                    self.last_action_result = error_msg
+            else:
+                error_msg = "Cannot place ring: no rings in inventory"
+                print(error_msg)
+                self.last_action_result = error_msg
 
         elif action == "LoadGoal":
-            # examine perimeter cells 1 tile away
+            if state['goal_loaded']:
+                error_msg = "Cannot load goal: already carrying a goal"
+                print(error_msg)
+                self.last_action_result = error_msg
+                return
+                
+            # Examine perimeter cells 1 tile away
             perim = []
             for i in range(ROBOT_SIZE):
                 perim.append((x + i, y - 1))
@@ -278,87 +558,151 @@ class RobotSimulator:
                 perim.append((x + i, y + ROBOT_SIZE))
                 perim.append((x - 1, y + i))
 
+            goal_found = False
             for nx, ny in perim:
                 if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE and 'G' in self.field.grid[ny][nx]:
-                    # We can load goals even if they're in scoring zones
+                    # Cannot load goals from stationary stakes
+                    stake_pos = (nx, ny)
+                    if stake_pos in NEUTRAL_WALL_STAKES or stake_pos == ALLIANCE_WALL_STAKES['red'] or stake_pos == ALLIANCE_WALL_STAKES['blue']:
+                        error_msg = f"Cannot load stationary stake at {stake_pos}"
+                        print(error_msg)
+                        self.last_action_result = error_msg
+                        continue
+                        
+                    # We can load mobile goals even if they're in scoring zones
                     goal_pos = (nx, ny)
                     self.field.grid[ny][nx].remove('G')
                     if goal_pos in self.goal_positions:
                         self.goal_positions.remove(goal_pos)
                         # Store the rings on this goal in the robot state
                         if goal_pos in self.goal_rings:
-                            # Could track these rings in robot state if desired
+                            # Track the rings on the loaded goal
+                            state['held_goal_rings'] = copy.deepcopy(self.goal_rings[goal_pos])
                             self.goal_rings.pop(goal_pos)
+                    
+                    # Loading a goal causes the robot to drop any rings it was carrying
+                    previous_rings = state['rings']
                     state['goal_loaded'] = True
                     state['rings'] = 0  # Reset rings when loading goal
+                    
+                    # Add status message about dropped rings
+                    goal_found = True
+                    ring_msg = f" (Dropped {previous_rings} rings)" if previous_rings > 0 else ""
+                    success_msg = f"Loaded goal from {goal_pos} with rings: {state['held_goal_rings']}{ring_msg}"
+                    print(success_msg)
+                    self.last_action_result = success_msg
                     break
+            
+            if not goal_found:
+                error_msg = "No mobile goal found to load"
+                print(error_msg)
+                self.last_action_result = error_msg
 
         elif action == "DeliverGoal":
-            # Check if any part of the robot is in a scoring zone
-            in_scoring_zone = False
+            if not state['goal_loaded']:
+                error_msg = "Cannot deliver goal: no goal loaded"
+                print(error_msg)
+                self.last_action_result = error_msg
+                return
+                
+            # Get all cells adjacent to the robot (not inside it)
+            perimeter = []
+            robot_cells = set(self._robot_cells())
             
-            # Get the appropriate scoring zones based on team color
-            if self.team_color == 'red':
-                positive_corners = POSITIVE_CORNERS
-                negative_corners = NEGATIVE_CORNERS
-            else:
-                positive_corners = POSITIVE_CORNERS_BLUE
-                negative_corners = NEGATIVE_CORNERS_BLUE
-            
-            # Check if any part of the robot is in a scoring zone
-            robot_cells = self._robot_cells()
+            # Check all cells around the robot's perimeter
             for rx, ry in robot_cells:
-                if (rx, ry) in positive_corners or (rx, ry) in negative_corners:
-                    in_scoring_zone = True
-                    break
+                for dx, dy in DIRS.values():
+                    nx, ny = rx + dx, ry + dy
+                    if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
+                        # Don't include cells that are part of the robot
+                        if (nx, ny) not in robot_cells:
+                            # Don't include cells that already have objects
+                            if not ('r' in self.field.grid[ny][nx] or 
+                                    'b' in self.field.grid[ny][nx] or 
+                                    'G' in self.field.grid[ny][nx] or 
+                                    "red_stake" in self.field.grid[ny][nx] or 
+                                    "blue_stake" in self.field.grid[ny][nx] or 
+                                    "neutral_stake" in self.field.grid[ny][nx]):
+                                perimeter.append((nx, ny))
             
-            if in_scoring_zone and state['goal_loaded']:
-                # Place the goal entirely within the scoring zone
-                # Find the center of the robot
-                cx, cy = x + ROBOT_SIZE//2 - 1, y + ROBOT_SIZE//2 - 1
+            # Get the positive zones
+            top_left_zone = [(0, 22), (1, 22), (0, 23), (1, 23)]
+            top_right_zone = [(22, 22), (23, 22), (22, 23), (23, 23)]
+            
+            # Check if any part of the robot is in a positive zone
+            in_positive_zone = any(cell in top_left_zone or cell in top_right_zone for cell in robot_cells)
+            
+            if in_positive_zone and perimeter:
+                # We're in a positive zone and have valid positions to place the goal
                 
-                # If we're at the edge, adjust to ensure goal is in scoring zone
-                for zone in [positive_corners, negative_corners]:
-                    if any((rx, ry) in zone for rx, ry in robot_cells):
-                        # Find center point of the zone
-                        zone_x = sum(x for x, y in zone) // len(zone)
-                        zone_y = sum(y for x, y in zone) // len(zone)
-                        
-                        # Adjust goal placement to be inside zone
-                        if (cx, cy) not in zone:
-                            # Find closest point in zone
-                            for zx, zy in zone:
-                                if abs(zx - cx) <= 1 and abs(zy - cy) <= 1:
-                                    cx, cy = zx, zy
-                                    break
+                # First try to find a position that's also in a positive zone
+                positive_positions = [pos for pos in perimeter if pos in top_left_zone or pos in top_right_zone]
                 
-                # Place the goal
-                self.field.grid[cy][cx].append('G')
-                self.goal_positions.append((cx, cy))
-                self.goal_rings[(cx, cy)] = {'red': 0, 'blue': 0}  # Initialize ring counter
-                state['goal_loaded'] = False
-                print(f"Delivered goal to ({cx}, {cy})")
+                if positive_positions:
+                    # Place the goal in a positive zone position
+                    cx, cy = positive_positions[0]
+                    self.field.grid[cy][cx].append('G')
+                    self.goal_positions.append((cx, cy))
+                    
+                    # Transfer rings from robot's held goal to the placed goal
+                    self.goal_rings[(cx, cy)] = copy.deepcopy(state['held_goal_rings'])
+                    state['held_goal_rings'] = {'red': 0, 'blue': 0}
+                    state['goal_loaded'] = False
+                    success_msg = f"Delivered goal to positive zone at ({cx}, {cy}) with rings: {self.goal_rings[(cx, cy)]}"
+                    print(success_msg)
+                    self.last_action_result = success_msg
+                else:
+                    # Place the goal in any valid position near the robot
+                    cx, cy = perimeter[0]
+                    self.field.grid[cy][cx].append('G')
+                    self.goal_positions.append((cx, cy))
+                    
+                    # Transfer rings from robot's held goal to the placed goal
+                    self.goal_rings[(cx, cy)] = copy.deepcopy(state['held_goal_rings'])
+                    state['held_goal_rings'] = {'red': 0, 'blue': 0}
+                    state['goal_loaded'] = False
+                    success_msg = f"Delivered goal adjacent to robot at ({cx}, {cy}) with rings: {self.goal_rings[(cx, cy)]}"
+                    print(success_msg)
+                    self.last_action_result = success_msg
+            elif perimeter:
+                # We're not in a positive zone but have valid positions to place the goal
+                
+                # Make sure we don't place in negative zones
+                negative_zones = [(0, 0), (1, 0), (0, 1), (1, 1), (22, 0), (23, 0), (22, 1), (23, 1)]
+                safe_positions = [pos for pos in perimeter if pos not in negative_zones]
+                
+                if safe_positions:
+                    cx, cy = safe_positions[0]
+                    self.field.grid[cy][cx].append('G')
+                    self.goal_positions.append((cx, cy))
+                    
+                    # Transfer rings from robot's held goal to the placed goal
+                    self.goal_rings[(cx, cy)] = copy.deepcopy(state['held_goal_rings'])
+                    state['held_goal_rings'] = {'red': 0, 'blue': 0}
+                    state['goal_loaded'] = False
+                    success_msg = f"Delivered goal to ({cx}, {cy}) with rings: {self.goal_rings[(cx, cy)]}"
+                    print(success_msg)
+                    self.last_action_result = success_msg
+                else:
+                    error_msg = "Cannot deliver goal: no valid placement positions outside negative zones"
+                    print(error_msg)
+                    self.last_action_result = error_msg
             else:
-                print("Cannot deliver goal: not in scoring zone or no goal loaded")
-
-    def _robot_cells(self):
-        """Return all cells covered by the robot"""
-        x, y = self.robot_positions[0]
-        cells = []
-        for dx in range(ROBOT_SIZE):
-            for dy in range(ROBOT_SIZE):
-                cells.append((x+dx, y+dy))
-        return cells
+                error_msg = "Cannot deliver goal: no valid placement positions around robot"
+                print(error_msg)
+                self.last_action_result = error_msg
 
 # ------------ VISUALISATION -----------
 def draw_field(sim):
-    fig, ax = plt.subplots(figsize=(10, 10))
+    fig, ax = plt.subplots(figsize=(12, 10))
     step_text = plt.figtext(0.02, 0.95, f"Step: 0 / {sim.max_steps}")
+    score_text = plt.figtext(0.5, 0.02, "", ha='center', fontsize=12)
     debug_text = plt.figtext(0.98, 0.02, "", ha='right', fontsize=8, color='gray')
     action_text = None  # Keep track of action text
+    status_text = None  # Keep track of action result status
 
     def repaint():
-        nonlocal action_text
+        nonlocal action_text, status_text
         ax.clear()
         ax.set_xlim(0, GRID_SIZE)
         ax.set_ylim(0, GRID_SIZE)
@@ -383,17 +727,44 @@ def draw_field(sim):
             cx, cy = np.mean(zone, axis=0)
             ax.text(cx+0.25, cy+0.25, label, color='black', fontsize=14, fontweight='bold')
             
-        # Fixed stakes (yellow)
-        for x, y in FIXED_STAKES:
+        # Neutral wall stakes (yellow)
+        for x, y in NEUTRAL_WALL_STAKES:
             ax.add_patch(patches.Rectangle((x, y), 1, 1, color='yellow'))
             ax.text(x+0.25, y+0.25, "S", color='black', fontsize=14, fontweight='bold')
+            
+            # Display ring counters for neutral stakes
+            if (x, y) in sim.stake_rings:
+                red_count = sim.stake_rings[(x, y)]['red']
+                blue_count = sim.stake_rings[(x, y)]['blue']
+                if red_count > 0 or blue_count > 0:
+                    ax.text(x+0.5, y+0.75, f"{red_count}R/{blue_count}B", 
+                           fontsize=8, ha='center', va='center', color='black')
         
-        # Colored stakes
-        ax.add_patch(patches.Rectangle((RED_STAKE[0], RED_STAKE[1]), 1, 1, color='darkred'))
-        ax.text(RED_STAKE[0]+0.25, RED_STAKE[1]+0.25, "S", color='white', fontsize=14, fontweight='bold')
+        # Alliance stakes
+        red_stake = ALLIANCE_WALL_STAKES['red']
+        blue_stake = ALLIANCE_WALL_STAKES['blue']
         
-        ax.add_patch(patches.Rectangle((BLUE_STAKE[0], BLUE_STAKE[1]), 1, 1, color='darkblue'))
-        ax.text(BLUE_STAKE[0]+0.25, BLUE_STAKE[1]+0.25, "S", color='white', fontsize=14, fontweight='bold')
+        ax.add_patch(patches.Rectangle((red_stake[0], red_stake[1]), 1, 1, color='darkred'))
+        ax.text(red_stake[0]+0.25, red_stake[1]+0.25, "S", color='white', fontsize=14, fontweight='bold')
+        
+        # Display ring counters for red alliance stake
+        if red_stake in sim.stake_rings:
+            red_count = sim.stake_rings[red_stake]['red']
+            blue_count = sim.stake_rings[red_stake]['blue']
+            if red_count > 0 or blue_count > 0:
+                ax.text(red_stake[0]+0.5, red_stake[1]+0.75, f"{red_count}R/{blue_count}B", 
+                       fontsize=8, ha='center', va='center', color='white')
+        
+        ax.add_patch(patches.Rectangle((blue_stake[0], blue_stake[1]), 1, 1, color='darkblue'))
+        ax.text(blue_stake[0]+0.25, blue_stake[1]+0.25, "S", color='white', fontsize=14, fontweight='bold')
+        
+        # Display ring counters for blue alliance stake
+        if blue_stake in sim.stake_rings:
+            red_count = sim.stake_rings[blue_stake]['red']
+            blue_count = sim.stake_rings[blue_stake]['blue']
+            if red_count > 0 or blue_count > 0:
+                ax.text(blue_stake[0]+0.5, blue_stake[1]+0.75, f"{red_count}R/{blue_count}B", 
+                       fontsize=8, ha='center', va='center', color='white')
 
         # highlight robot zone
         rx, ry = sim.robot_positions[0]
@@ -431,27 +802,45 @@ def draw_field(sim):
             ax.text(cx, cy, f"{state['rings']}", fontsize=14, fontweight='bold', color='white')
         if state['goal_loaded']:
             ax.add_patch(patches.Circle((cx, cy), 0.25, facecolor=MOBILE_GOAL.color, edgecolor='black'))
+            
+            # If the goal has rings, show their count
+            if state['held_goal_rings']['red'] > 0 or state['held_goal_rings']['blue'] > 0:
+                red_count = state['held_goal_rings']['red']
+                blue_count = state['held_goal_rings']['blue'] 
+                ax.text(cx, cy+0.4, f"{red_count}R/{blue_count}B", 
+                       fontsize=8, ha='center', va='center', color='black',
+                       bbox=dict(facecolor='white', alpha=0.7, boxstyle='round'))
 
         plt.gca().invert_yaxis()
         step_text.set_text(f"Step: {sim.current_step} / {sim.max_steps}")
+        score_text.set_text(f"Score - Red: {sim.current_score['red']} | Blue: {sim.current_score['blue']}")
         debug_text.set_text(f"Updated: {time.strftime('%H:%M:%S')}")
 
-        # Remove previous action text if it exists
+        # Remove previous text elements if they exist
         if action_text is not None:
             action_text.remove()
             action_text = None
+        if status_text is not None:
+            status_text.remove()
+            status_text = None
 
-        # show active action
+        # Show active action
         if sim.current_step > 0 and sim.current_step-1 < sim.max_steps:
             action = sim.plans[0][sim.current_step-1]
             action_text = plt.figtext(0.5, 0.95, f"Action: {action}", ha='center', fontsize=12,
                           bbox=dict(facecolor='white', alpha=0.7, boxstyle='round'))
+            
+            # Display action result status if available
+            if hasattr(sim, 'last_action_result') and sim.last_action_result:
+                status_color = 'red' if any(x in sim.last_action_result.lower() for x in ['invalid', 'error', 'cannot', 'no']) else 'green'
+                status_text = plt.figtext(0.5, 0.91, sim.last_action_result, ha='center', fontsize=10,
+                              color=status_color, bbox=dict(facecolor='white', alpha=0.7, boxstyle='round'))
 
         plt.title(f"VEX U High Stakes — {sim.team_color.capitalize()} Alliance")
         fig.canvas.draw_idle()
 
     # ---- buttons ----
-    btn_y = 0.02
+    btn_y = 0.05
     prev_ax = plt.axes([0.15, btn_y, 0.15, 0.05])
     reset_ax = plt.axes([0.425, btn_y, 0.15, 0.05])
     next_ax = plt.axes([0.7, btn_y, 0.15, 0.05])
@@ -462,21 +851,18 @@ def draw_field(sim):
     def on_prev_click(event):
         success = sim.step_backward()
         if success:
-            print("Stepped backward")
             repaint()
         else:
-            print("Cannot step backward further")
+            print("Already at beginning of simulation")
 
     def on_next_click(event):
         success = sim.step_forward()
         if success:
-            print("Stepped forward")
             repaint()
         else:
             print("End of plan reached")
 
     def on_reset_click(event):
-        print("Resetting simulation")
         sim.reset()
         repaint()
 
@@ -485,7 +871,7 @@ def draw_field(sim):
     reset_btn.on_clicked(on_reset_click)
 
     repaint()
-    plt.tight_layout(rect=[0, 0.07, 1, 0.93])
+    plt.tight_layout(rect=[0, 0.1, 1, 0.93])
     plt.show()
 
 # ------------ UI ----------------------
@@ -500,13 +886,14 @@ def on_team_select(team):
         print("Make sure you have created the file 'ai_search_engine.py'")
         return
 
-    spawn = (0, 21) if team == "blue" else (21, 0)
+    # Use designated spawn positions instead of end zones
+    spawn = SPAWN_POSITION[team]
     sx, sy = spawn
-    start_state = State(x=sx, y=sy, rings=0, delivered=0, goal_loaded=False)
+    start_state = State(x=sx, y=sy, rings=0, held_goals=(), steps=0)
     
     print("Starting search for plan...")
     t0 = time.time()
-    plan = a_star_search(start_state, field.get_grid(), team)
+    plan = a_star_search(start_state, field.get_grid(), team, field.stake_rings)
     t1 = time.time()
     
     if not plan:
